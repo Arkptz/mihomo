@@ -46,6 +46,10 @@ func dialUDP(network string, lAddr, rAddr netip.AddrPort) (uc *net.UDPConn, err 
 		return nil, err
 	}
 
+	if err = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+		return nil, err
+	}
+
 	if err = syscall.SetsockoptInt(fd, syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err != nil {
 		return nil, err
 	}
