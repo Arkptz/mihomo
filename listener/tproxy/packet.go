@@ -80,6 +80,13 @@ func createOrGetLocalConn(rAddr, lAddr netip.AddrPort, tunnel C.Tunnel, addition
 			conn, err := listenLocalConn(rAddr, lAddr, tunnel, additions...)
 			if err != nil {
 				log.Errorln("listenLocalConn failed with error: %s, packet loss (rAddr[%T]=%s lAddr[%T]=%s)", err.Error(), rAddr, remote, lAddr, local)
+				// Evict the stale local-conn mapping so a retried bind to the
+				// same (lAddr, rAddr) does not keep colliding with a phantom
+				// holder that no longer has a live kernel socket. Without this
+				// the entry leaks and every subsequent access logs EADDRINUSE
+				// ("address already in use, packet loss") while the reverse
+				// socket is silently dropped.
+				natTable.DeleteForLocalConn(local, remote)
 				return nil, err
 			}
 			natTable.AddForLocalConn(local, remote, conn)
