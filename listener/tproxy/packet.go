@@ -8,6 +8,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/common/pool"
+	"github.com/metacubex/mihomo/common/xsync"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 )
@@ -80,16 +81,28 @@ func createOrGetLocalConn(rAddr, lAddr netip.AddrPort, tunnel C.Tunnel, addition
 			conn, err := listenLocalConn(rAddr, lAddr, tunnel, additions...)
 			if err != nil {
 				log.Errorln("listenLocalConn failed with error: %s, packet loss (rAddr[%T]=%s lAddr[%T]=%s)", err.Error(), rAddr, remote, lAddr, local)
-				// Evict the stale local-conn mapping so a retried bind to the
-				// same (lAddr, rAddr) does not keep colliding with a phantom
-				// holder that no longer has a live kernel socket. Without this
-				// the entry leaks and every subsequent access logs EADDRINUSE
-				// ("address already in use, packet loss") while the reverse
-				// socket is silently dropped.
+				// The bind failed because a previous socket for this exact
+				// (lAddr, rAddr) pair still exists somewhere: either as an
+				// orphaned fd whose NAT entry was already timed out, or as a
+				// tracked conn that lost its table entry. Deleting only the
+				// mapping cannot free the port — the kernel keeps honoring
+				// the old fd's bind. Close the phantom via the process-wide
+				// registry, evict any stale mapping, then retry ONCE so the
+				// triggering packet is not lost.
 				natTable.DeleteForLocalConn(local, remote)
-				return nil, err
+				closePhantomLocalConn(lAddr, rAddr)
+				conn, err = listenLocalConn(rAddr, lAddr, tunnel, additions...)
+				if err != nil {
+					return nil, err
+				}
 			}
-			natTable.AddForLocalConn(local, remote, conn)
+			if !natTable.AddForLocalConn(local, remote, conn) {
+				// Entry vanished between listen and add — close immediately,
+				// otherwise this bound socket becomes an untracked orphan that
+				// pins the port forever (the next createOrGetLocalConn for the
+				// same pair would hit EADDRINUSE against it).
+				conn.Close()
+			}
 			localConn = conn
 		}
 	}
@@ -103,6 +116,7 @@ func listenLocalConn(rAddr, lAddr netip.AddrPort, tunnel C.Tunnel, additions ...
 	if err != nil {
 		return nil, err
 	}
+	trackLocalConn(lAddr, rAddr, lc)
 	go func() {
 		log.Debugln("TProxy listenLocalConn rAddr=%s lAddr=%s", rAddr, lAddr)
 		for {
@@ -121,4 +135,38 @@ func listenLocalConn(rAddr, lAddr netip.AddrPort, tunnel C.Tunnel, additions ...
 		}
 	}()
 	return lc, nil
+}
+
+// localConnRegistry tracks every transparent reverse socket created by
+// listenLocalConn for the lifetime of the process, keyed by (lAddr, rAddr).
+//
+// Why this exists: the NAT table (tunnel.NatTable) evicts its entries on a
+// udpTimeout timer, but eviction does NOT close the sockets stored in
+// LocalUDPConnMap — closeAllLocalCoon only runs when the parent UDP session
+// (handleUDPToLocal) ends. If the session outlives the NAT entry, or the
+// entry is dropped while a bind retry is in flight, a socket can end up
+// referenced by nothing: a live fd that still pins its kernel bind, invisible
+// to every future createOrGetLocalConn lookup. Any later bind for the same
+// (lAddr, rAddr) pair then fails with EADDRINUSE forever ("address already
+// in use, packet loss") — the observed Tailscale :41641 outage. The registry
+// gives us a way to find and Close such phantoms.
+var localConnRegistry = xsync.Map[string, *net.UDPConn]{}
+
+func localConnKey(lAddr, rAddr netip.AddrPort) string {
+	return lAddr.String() + "|" + rAddr.String()
+}
+
+func trackLocalConn(lAddr, rAddr netip.AddrPort, lc *net.UDPConn) {
+	localConnRegistry.Store(localConnKey(lAddr, rAddr), lc)
+}
+
+// closePhantomLocalConn closes any still-open socket previously created for
+// this (lAddr, rAddr) pair and removes it from the registry. Safe to call
+// when no phantom exists.
+func closePhantomLocalConn(lAddr, rAddr netip.AddrPort) {
+	key := localConnKey(lAddr, rAddr)
+	if old, ok := localConnRegistry.Load(key); ok {
+		_ = old.Close()
+		localConnRegistry.Delete(key)
+	}
 }
